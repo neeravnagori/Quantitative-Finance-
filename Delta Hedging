@@ -1,0 +1,204 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import math
+from pathlib import Path
+
+# ---------- Normal distribution helpers without scipy ----------
+def norm_cdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+def norm_pdf(x):
+    return (1.0 / math.sqrt(2.0 * math.pi)) * math.exp(-0.5 * x * x)
+
+# ---------- Black-Scholes helper functions ----------
+def d1_d2(S, K, T, r, sigma):
+    T = max(T, 0.001)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    return d1, d2
+
+def call_price(S, K, T, r, sigma):
+    d1, d2 = d1_d2(S, K, T, r, sigma)
+    return S * norm_cdf(d1) - K * math.exp(-r * T) * norm_cdf(d2)
+
+def call_delta(S, K, T, r, sigma):
+    d1, _ = d1_d2(S, K, T, r, sigma)
+    return norm_cdf(d1)
+
+def call_gamma(S, K, T, r, sigma):
+    d1, _ = d1_d2(S, K, T, r, sigma)
+    return norm_pdf(d1) / (S * sigma * math.sqrt(max(T, 0.001)))
+
+# ---------- Simulate ITC price movement ----------
+np.random.seed(42)
+S_current = 420.0
+returns = np.random.normal(0.0005, 0.015, 30)
+prices = [S_current]
+
+for ret in returns:
+    prices.append(prices[-1] * (1 + ret))
+
+prices = np.array(prices)
+
+# ---------- Parameters ----------
+K = S_current
+T_initial = 30 / 365
+r = 0.06
+sigma = 0.25
+position_shares = 100
+
+initial_call_price = call_price(S_current, K, T_initial, r, sigma)
+initial_delta = call_delta(S_current, K, T_initial, r, sigma)
+
+# ---------- Run delta hedging simulation ----------
+rows = []
+shares_held = -initial_delta * position_shares
+cumulative_hedge_cost = 0.0
+previous_share_price = S_current
+
+for i, S in enumerate(prices):
+    T_remaining = max((T_initial * 365 - i) / 365, 0.001)
+
+    delta = call_delta(float(S), K, T_remaining, r, sigma)
+    gamma = call_gamma(float(S), K, T_remaining, r, sigma)
+    call_val = call_price(float(S), K, T_remaining, r, sigma)
+
+    shares_to_hold = -delta * position_shares
+    shares_to_trade = shares_to_hold - shares_held
+
+    rehedge_cost = shares_to_trade * float(S)
+    cumulative_hedge_cost += rehedge_cost
+
+    price_move = float(S) - previous_share_price
+    gamma_pnl = 0.5 * gamma * position_shares * (price_move ** 2)
+
+    rows.append({
+        "Day": i,
+        "Price": float(S),
+        "Delta": delta,
+        "Gamma": gamma,
+        "Call Value": call_val,
+        "Shares": shares_to_hold,
+        "Cumulative Hedge": cumulative_hedge_cost,
+        "Gamma P&L": gamma_pnl,
+    })
+
+    shares_held = shares_to_hold
+    previous_share_price = float(S)
+
+results_df = pd.DataFrame(rows)
+results_df["Cumulative Gamma P&L"] = results_df["Gamma P&L"].cumsum()
+
+out_dir = Path("/mnt/data")
+analysis_png = out_dir / "delta_hedging_itc_analysis.png"
+table_png = out_dir / "delta_hedging_table_itc.png"
+csv_file = out_dir / "delta_hedging_itc_results.csv"
+results_df.to_csv(csv_file, index=False)
+
+# ---------- PNG 1: 4-panel analysis ----------
+fig = plt.figure(figsize=(16, 11))
+fig.suptitle("Delta Hedging Analysis: ITC Call Option Simulation", fontsize=16, fontweight="bold")
+
+ax1 = plt.subplot(2, 2, 1)
+ax1_twin = ax1.twinx()
+line1 = ax1.plot(results_df["Day"], results_df["Price"], linewidth=2.5, label="ITC Stock Price")
+line2 = ax1_twin.plot(results_df["Day"], results_df["Delta"], linewidth=2.5, label="Option Delta")
+ax1.set_ylabel("ITC Price (Rs)", fontsize=11, fontweight="bold")
+ax1_twin.set_ylabel("Delta", fontsize=11, fontweight="bold")
+ax1.set_xlabel("Days", fontsize=11, fontweight="bold")
+ax1.grid(True, alpha=0.3, linestyle="--")
+lines = line1 + line2
+ax1.legend(lines, [line.get_label() for line in lines], loc="upper left")
+ax1.set_title("ITC Price vs Option Delta", fontsize=12, fontweight="bold")
+
+ax2 = plt.subplot(2, 2, 2)
+ax2.plot(results_df["Day"], results_df["Gamma"], linewidth=2.5, marker="o", markersize=3)
+ax2.fill_between(results_df["Day"], 0, results_df["Gamma"], alpha=0.25)
+ax2.set_xlabel("Days", fontsize=11, fontweight="bold")
+ax2.set_ylabel("Gamma", fontsize=11, fontweight="bold")
+ax2.set_title("Gamma / Convexity Over Time", fontsize=12, fontweight="bold")
+ax2.grid(True, alpha=0.3, linestyle="--")
+ax2.text(0.5, 0.92, "Gamma measures how quickly delta changes", transform=ax2.transAxes, ha="center", fontsize=9, bbox=dict(boxstyle="round", alpha=0.2))
+
+ax3 = plt.subplot(2, 2, 3)
+ax3.bar(results_df["Day"], results_df["Gamma P&L"], alpha=0.65)
+ax3.plot(results_df["Day"], results_df["Cumulative Gamma P&L"], linewidth=2.5, marker="s", markersize=3, label="Cumulative Gamma P&L")
+ax3.set_xlabel("Days", fontsize=11, fontweight="bold")
+ax3.set_ylabel("P&L (Rs)", fontsize=11, fontweight="bold")
+ax3.set_title("Daily and Cumulative Gamma P&L", fontsize=12, fontweight="bold")
+ax3.grid(True, alpha=0.3, linestyle="--", axis="y")
+ax3.axhline(y=0, linestyle="-", linewidth=0.8)
+ax3.legend(loc="upper left")
+
+ax4 = plt.subplot(2, 2, 4)
+ax4.plot(results_df["Day"], results_df["Shares"], linewidth=2.5, marker="^", markersize=3)
+ax4.fill_between(results_df["Day"], 0, results_df["Shares"], alpha=0.25)
+ax4.set_xlabel("Days", fontsize=11, fontweight="bold")
+ax4.set_ylabel("Shares Held / Shorted", fontsize=11, fontweight="bold")
+ax4.set_title("Dynamic Hedge Position", fontsize=12, fontweight="bold")
+ax4.grid(True, alpha=0.3, linestyle="--")
+ax4.axhline(y=0, linestyle="-", linewidth=0.8)
+ax4.text(0.5, 0.1, "Negative shares = short stock to hedge a long call", transform=ax4.transAxes, ha="center", fontsize=9, bbox=dict(boxstyle="round", alpha=0.2))
+
+plt.tight_layout(rect=[0, 0, 1, 0.96])
+plt.savefig(analysis_png, dpi=300, bbox_inches="tight")
+plt.close()
+
+# ---------- PNG 2: table breakdown ----------
+fig, ax = plt.subplots(figsize=(17, 8))
+ax.axis("off")
+
+table_data = [["Day", "Price (Rs)", "Delta", "Gamma", "Shares to Hold", "Daily Gamma P&L", "Cumulative Hedge"]]
+sampled_days = list(range(0, len(results_df), 3))
+if len(results_df) - 1 not in sampled_days:
+    sampled_days.append(len(results_df) - 1)
+
+for i in sampled_days:
+    row = results_df.iloc[i]
+    table_data.append([
+        f"{int(row['Day'])}",
+        f"{row['Price']:.2f}",
+        f"{row['Delta']:.4f}",
+        f"{row['Gamma']:.6f}",
+        f"{row['Shares']:.2f}",
+        f"{row['Gamma P&L']:.2f}",
+        f"{row['Cumulative Hedge']:.2f}",
+    ])
+
+table = ax.table(
+    cellText=table_data,
+    cellLoc="center",
+    loc="center",
+    colWidths=[0.08, 0.12, 0.12, 0.12, 0.15, 0.16, 0.17],
+)
+table.auto_set_font_size(False)
+table.set_fontsize(10)
+table.scale(1, 2.3)
+
+for i in range(len(table_data[0])):
+    table[(0, i)].set_text_props(weight="bold")
+
+plt.title("Delta Hedging Results: ITC Call Option Simulation", fontsize=15, fontweight="bold", pad=18)
+
+interpretation_text = (
+    "Interpretation: Delta determines the stock hedge needed for the long call. "
+    "Gamma explains why the hedge must be adjusted as the stock moves. "
+    "The cumulative hedge column tracks the cash impact of rebalancing the hedge over time."
+)
+
+plt.figtext(0.5, 0.02, interpretation_text, ha="center", va="bottom", fontsize=10, wrap=True, bbox=dict(boxstyle="round", alpha=0.2))
+plt.tight_layout(rect=[0, 0.06, 1, 0.95])
+plt.savefig(table_png, dpi=300, bbox_inches="tight")
+plt.close()
+
+print("Files created:")
+print(analysis_png)
+print(table_png)
+print(csv_file)
+print()
+print(f"Initial call price: Rs {initial_call_price:.4f}")
+print(f"Initial delta: {initial_delta:.4f}")
+print(f"Delta range: {results_df['Delta'].min():.4f} to {results_df['Delta'].max():.4f}")
+print(f"Gamma peak: {results_df['Gamma'].max():.6f}")
+print(f"Cumulative gamma P&L: Rs {results_df['Gamma P&L'].sum():.2f}")
