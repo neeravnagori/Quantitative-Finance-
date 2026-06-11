@@ -1,0 +1,394 @@
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+from scipy import stats
+from sklearn.linear_model import LinearRegression
+
+class StationarityTester:
+    @staticmethod
+    def adf_test(series, name=""):
+        n = len(series)
+        mean = np.mean(series)
+        variance = np.sum((series - mean)**2) / n
+        diffs = np.diff(series)
+        autocovariance = np.sum((diffs - np.mean(diffs))**2) / n
+        t_stat = (np.mean(series) - 0) / (np.sqrt(variance / n) + 1e-6)
+        p_value = 2 * (1 - stats.norm.cdf(abs(t_stat)))
+        return {"series": name, "t_stat": t_stat, "p_value": min(p_value, 1.0), "stationary": p_value < 0.05}
+
+class PairsIdentifier:
+    def __init__(self, returns_data):
+        self.returns = returns_data
+        self.pairs = []
+        
+    def find_cointegrated_pairs(self, min_correlation=0.70, max_pairs=10):
+        corr_matrix = np.corrcoef(self.returns.T)
+        symbols = list(self.returns.columns)
+        
+        for i in range(len(symbols)):
+            for j in range(i+1, len(symbols)):
+                if corr_matrix[i, j] > min_correlation:
+                    s1 = self.returns.iloc[:, i].values
+                    s2 = self.returns.iloc[:, j].values
+                    spread = s1 - corr_matrix[i, j] * s2
+                    adf_result = StationarityTester.adf_test(spread)
+                    
+                    if adf_result["stationary"]:
+                        self.pairs.append({
+                            "stock1": symbols[i],
+                            "stock2": symbols[j],
+                            "correlation": corr_matrix[i, j],
+                            "adf_pvalue": adf_result["p_value"],
+                            "spread_std": np.std(spread)
+                        })
+        
+        return sorted(self.pairs, key=lambda x: x["adf_pvalue"])[:max_pairs]
+
+class KalmanFilterOptimized:
+    def __init__(self, q, r, x=0, p=1):
+        self.q = q
+        self.r = r
+        self.x = x
+        self.p = p
+        self.k_history = []
+        
+    def filter(self, z):
+        self.p = self.p + self.q
+        self.k = self.p / (self.p + self.r)
+        self.x = self.x + self.k * (z - self.x)
+        self.p = (1 - self.k) * self.p
+        self.k_history.append(self.k)
+        return self.x
+
+class SpreadTrader:
+    def __init__(self, stock1_prices, stock2_prices, hedge_ratio):
+        self.s1_orig = np.array(stock1_prices)
+        self.s2_orig = np.array(stock2_prices)
+        self.hedge_ratio = hedge_ratio
+        
+        self.s1 = (self.s1_orig - np.mean(self.s1_orig)) / np.std(self.s1_orig)
+        self.s2 = (self.s2_orig - np.mean(self.s2_orig)) / np.std(self.s2_orig)
+        self.spread = self.s1 - hedge_ratio * self.s2
+        
+    def calculate_spread_metrics(self):
+        spread_mean = np.mean(self.spread)
+        spread_std = np.std(self.spread)
+        
+        return {
+            "mean": spread_mean,
+            "std": spread_std,
+            "upper_band": spread_mean + 2*spread_std,
+            "lower_band": spread_mean - 2*spread_std,
+            "z_scores": (self.spread - spread_mean) / spread_std
+        }
+    
+    def generate_signals(self, metrics, entry_threshold=2.0, exit_threshold=0.5):
+        z_scores = metrics["z_scores"]
+        signals = np.zeros(len(z_scores))
+        
+        for i in range(1, len(z_scores)):
+            if z_scores[i] > entry_threshold and z_scores[i-1] <= entry_threshold:
+                signals[i] = -1
+            elif z_scores[i] < -entry_threshold and z_scores[i-1] >= -entry_threshold:
+                signals[i] = 1
+            elif abs(z_scores[i]) < exit_threshold:
+                signals[i] = 0
+        
+        return signals
+    
+    def backtest(self, signals, initial_capital=100000, transaction_cost=0.0005):
+        pnl = np.zeros(len(self.s1))
+        position = 0
+        trades = []
+        
+        spread_range = np.max(self.spread) - np.min(self.spread)
+        
+        for i in range(1, len(self.s1)):
+            if signals[i] != 0 and signals[i] != position:
+                if position == 0:
+                    trade_entry = self.spread[i]
+                    position = signals[i]
+                    trades.append({"entry": i, "entry_spread": trade_entry, "type": "long" if position == 1 else "short"})
+                else:
+                    trade_exit = self.spread[i]
+                    spread_change = trade_exit - trades[-1]["entry_spread"]
+                    pnl_trade = position * spread_change * initial_capital / (spread_range + 1e-6)
+                    pnl[i] = pnl_trade
+                    position = signals[i] if signals[i] != 0 else 0
+                    trades[-1]["exit"] = i
+                    trades[-1]["exit_spread"] = trade_exit
+                    trades[-1]["pnl"] = pnl_trade
+        
+        cumulative_pnl = np.cumsum(pnl)
+        total_pnl = np.sum(pnl)
+        
+        return {
+            "pnl": pnl,
+            "cumulative_pnl": cumulative_pnl,
+            "total_return": (total_pnl / initial_capital) * 100,
+            "trades": [t for t in trades if "exit" in t],
+            "winning_trades": len([t for t in trades if "exit" in t and t["pnl"] > 0]),
+            "total_trades": len([t for t in trades if "exit" in t]),
+            "sharpe": np.mean(pnl[pnl!=0]) / (np.std(pnl[pnl!=0]) + 1e-6) * np.sqrt(252) if np.sum(np.abs(pnl)) > 0 else 0,
+            "max_drawdown": np.min(cumulative_pnl) if len(cumulative_pnl) > 0 else 0
+        }
+
+def generate_pairs_data(n_days=504):
+    np.random.seed(42)
+    dates = pd.date_range(end=datetime.now(), periods=n_days, freq='D')
+    
+    common_factor = np.cumsum(np.random.normal(0.0005, 0.01, n_days))
+    stock1_returns = common_factor + np.random.normal(0, 0.008, n_days)
+    stock2_returns = common_factor + np.random.normal(0, 0.008, n_days)
+    stock3_returns = np.cumsum(np.random.normal(0.0003, 0.012, n_days))
+    stock4_returns = np.cumsum(np.random.normal(0.0002, 0.009, n_days))
+    
+    s1_prices = 1000 * np.exp(np.cumsum(stock1_returns))
+    s2_prices = 950 * np.exp(np.cumsum(stock2_returns))
+    s3_prices = 1100 * np.exp(np.cumsum(stock3_returns))
+    s4_prices = 850 * np.exp(np.cumsum(stock4_returns))
+    
+    return pd.DataFrame({
+        'HDFC': s1_prices,
+        'ICICI': s2_prices,
+        'Axis': s3_prices,
+        'Kotak': s4_prices
+    }, index=dates)
+
+def create_visualization(pair_name, prices, spread, metrics, signals, backtest_result, dates):
+    fig, axes = plt.subplots(3, 2, figsize=(16, 12))
+    fig.suptitle('Pairs Trading Analysis - Cointegration + Kalman Filtering', 
+                 fontsize=14, fontweight='bold', y=0.995)
+    
+    ax1 = axes[0, 0]
+    ax1.plot(dates, prices[:, 0], label='Stock 1', linewidth=2, color='#3498db')
+    ax1.plot(dates, prices[:, 1], label='Stock 2', linewidth=2, color='#e74c3c')
+    ax1.set_title(f'{pair_name} - Normalized Price Series', fontsize=12, fontweight='bold')
+    ax1.legend(fontsize=9)
+    ax1.grid(True, alpha=0.3)
+    ax1.set_ylabel('Normalized Price', fontweight='bold', fontsize=10)
+    
+    ax2 = axes[0, 1]
+    ax2.plot(dates, spread, label='Spread', linewidth=2, color='#2ecc71')
+    ax2.axhline(y=metrics["mean"], color='black', linestyle='--', linewidth=1.5, label='Mean')
+    ax2.axhline(y=metrics["upper_band"], color='red', linestyle='--', linewidth=1.5, label='±2σ')
+    ax2.axhline(y=metrics["lower_band"], color='red', linestyle='--', linewidth=1.5)
+    ax2.fill_between(dates, metrics["lower_band"], metrics["upper_band"], alpha=0.15, color='orange')
+    ax2.set_title('Spread with Bollinger Bands', fontsize=12, fontweight='bold')
+    ax2.legend(fontsize=9)
+    ax2.grid(True, alpha=0.3)
+    ax2.set_ylabel('Spread Value', fontweight='bold', fontsize=10)
+    
+    ax3 = axes[1, 0]
+    colors = ['green' if z > 0 else 'red' for z in metrics["z_scores"]]
+    ax3.bar(dates, metrics["z_scores"], color=colors, alpha=0.6, width=1)
+    ax3.axhline(y=2, color='darkred', linestyle='--', linewidth=2, label='Entry (±2σ)')
+    ax3.axhline(y=-2, color='darkred', linestyle='--', linewidth=2)
+    ax3.axhline(y=0, color='black', linewidth=0.8)
+    ax3.set_title('Z-Score (Deviation from Mean)', fontsize=12, fontweight='bold')
+    ax3.legend(fontsize=9)
+    ax3.grid(True, alpha=0.3)
+    ax3.set_ylabel('Z-Score', fontweight='bold', fontsize=10)
+    
+    ax4 = axes[1, 1]
+    ax4.plot(dates, spread, linewidth=2, color='#2ecc71', label='Spread', zorder=2)
+    long_mask = signals == 1
+    short_mask = signals == -1
+    if np.any(long_mask):
+        ax4.scatter(dates[long_mask], spread[long_mask], color='green', s=100, 
+                   marker='^', label='Long Entry', zorder=5)
+    if np.any(short_mask):
+        ax4.scatter(dates[short_mask], spread[short_mask], color='red', s=100, 
+                   marker='v', label='Short Entry', zorder=5)
+    ax4.set_title('Trading Signals on Spread', fontsize=12, fontweight='bold')
+    ax4.legend(fontsize=9)
+    ax4.grid(True, alpha=0.3)
+    ax4.set_ylabel('Spread', fontweight='bold', fontsize=10)
+    
+    ax5 = axes[2, 0]
+    ax5.plot(dates, backtest_result["cumulative_pnl"], linewidth=2.5, color='#9b59b6')
+    ax5.fill_between(dates, 0, backtest_result["cumulative_pnl"], 
+                     where=(backtest_result["cumulative_pnl"]>=0), alpha=0.3, color='green', label='Gains')
+    ax5.fill_between(dates, 0, backtest_result["cumulative_pnl"],
+                     where=(backtest_result["cumulative_pnl"]<0), alpha=0.3, color='red', label='Losses')
+    ax5.axhline(y=0, color='black', linewidth=0.8)
+    ax5.set_title(f'Cumulative P&L - Sharpe: {backtest_result["sharpe"]:.2f}', 
+                 fontsize=12, fontweight='bold')
+    ax5.grid(True, alpha=0.3)
+    ax5.set_ylabel('P&L (₹)', fontweight='bold', fontsize=10)
+    ax5.set_xlabel('Date', fontweight='bold', fontsize=10)
+    ax5.legend(fontsize=9)
+    
+    ax6 = axes[2, 1]
+    trade_pnls = [t["pnl"] for t in backtest_result["trades"]]
+    if trade_pnls:
+        colors_pnl = ['green' if p > 0 else 'red' for p in trade_pnls]
+        bars = ax6.bar(range(len(trade_pnls)), trade_pnls, color=colors_pnl, alpha=0.7, edgecolor='black')
+        ax6.axhline(y=0, color='black', linewidth=0.8)
+        win_rate = backtest_result["winning_trades"] / max(backtest_result["total_trades"], 1)
+        ax6.set_title(f'Individual Trades (Win Rate: {win_rate*100:.1f}%)', fontsize=12, fontweight='bold')
+        ax6.set_xlabel('Trade #', fontweight='bold', fontsize=10)
+        ax6.set_ylabel('P&L (₹)', fontweight='bold', fontsize=10)
+    ax6.grid(True, alpha=0.3, axis='y')
+    
+    plt.tight_layout()
+    return fig
+
+print("\n" + "="*85)
+print("  PAIRS TRADING WITH COINTEGRATION & KALMAN FILTERING")
+print("  Advanced Quantitative Trading Strategy - Intermediate Level")
+print("="*85 + "\n")
+
+prices_data = generate_pairs_data(n_days=504)
+dates = prices_data.index
+
+print(f"Analysis Period: {dates[0].date()} to {dates[-1].date()}")
+print(f"Total Days: {len(prices_data)}")
+print(f"Stocks Analyzed: {', '.join(prices_data.columns)}\n")
+
+returns = prices_data.pct_change().dropna()
+
+print("─" * 85)
+print("STEP 1: IDENTIFYING COINTEGRATED PAIRS")
+print("─" * 85 + "\n")
+
+pairs_finder = PairsIdentifier(returns)
+cointegrated_pairs = pairs_finder.find_cointegrated_pairs(min_correlation=0.70, max_pairs=5)
+
+if cointegrated_pairs:
+    for idx, pair in enumerate(cointegrated_pairs, 1):
+        print(f"{idx}. {pair['stock1']} ↔ {pair['stock2']}")
+        print(f"   Correlation: {pair['correlation']:.4f} | P-value: {pair['adf_pvalue']:.6f} {'✓' if pair['adf_pvalue'] < 0.05 else '✗'}")
+        print(f"   Spread Std: {pair['spread_std']:.6f}\n")
+else:
+    print("No cointegrated pairs found. Using default pair.\n")
+
+print("─" * 85)
+print("STEP 2: HEDGING RATIO OPTIMIZATION (OLS Regression)")
+print("─" * 85 + "\n")
+
+s1_idx, s2_idx = 0, 1
+s1_name, s2_name = prices_data.columns[s1_idx], prices_data.columns[s2_idx]
+s1_prices = prices_data.iloc[:, s1_idx].values
+s2_prices = prices_data.iloc[:, s2_idx].values
+
+s1_norm = (s1_prices - np.mean(s1_prices)) / (np.std(s1_prices) + 1e-6)
+s2_norm = (s2_prices - np.mean(s2_prices)) / (np.std(s2_prices) + 1e-6)
+
+X = s2_norm.reshape(-1, 1)
+y = s1_norm
+lr = LinearRegression()
+lr.fit(X, y)
+hedge_ratio = lr.coef_[0]
+r_squared = lr.score(X, y)
+
+print(f"Selected Pair: {s1_name} + {s2_name}")
+print(f"Optimal Hedge Ratio: {hedge_ratio:.4f}")
+print(f"R² Score (Goodness of Fit): {r_squared:.6f}")
+print(f"Interpretation: {r_squared*100:.2f}% of variance explained\n")
+
+print("─" * 85)
+print("STEP 3: SPREAD ANALYSIS & KALMAN FILTERING")
+print("─" * 85 + "\n")
+
+trader = SpreadTrader(s1_prices, s2_prices, hedge_ratio)
+metrics = trader.calculate_spread_metrics()
+
+kf = KalmanFilterOptimized(q=0.01, r=0.1)
+filtered_spread = np.array([kf.filter(price) for price in trader.spread])
+
+print(f"Spread Statistics (Normalized):")
+print(f"  Mean: {metrics['mean']:.4f} | Std Dev: {metrics['std']:.4f}")
+print(f"  Upper Band (+2σ): {metrics['upper_band']:.4f}")
+print(f"  Lower Band (-2σ): {metrics['lower_band']:.4f}")
+print(f"  Current Value: {trader.spread[-1]:.4f} | Current Z-Score: {metrics['z_scores'][-1]:.2f}\n")
+
+kalman_noise_reduction = (1 - np.std(filtered_spread)/np.std(trader.spread)) * 100
+print(f"Kalman Filter Metrics:")
+print(f"  Process Noise (Q): 0.01 | Measurement Noise (R): 0.10")
+print(f"  Average Kalman Gain: {np.mean(kf.k_history):.4f}")
+print(f"  Noise Reduction: {kalman_noise_reduction:.2f}%\n")
+
+print("─" * 85)
+print("STEP 4: SIGNAL GENERATION & BACKTESTING")
+print("─" * 85 + "\n")
+
+signals = trader.generate_signals(metrics, entry_threshold=2.0, exit_threshold=0.5)
+backtest_result = trader.backtest(signals, initial_capital=100000)
+
+print(f"Backtest Results (Initial Capital: ₹100,000):")
+print(f"  Total Return: {backtest_result['total_return']:.2f}%")
+print(f"  Sharpe Ratio: {backtest_result['sharpe']:.4f}")
+print(f"  Max Drawdown: ₹{backtest_result['max_drawdown']:.2f}")
+print(f"  Total Trades Executed: {backtest_result['total_trades']}")
+print(f"  Winning Trades: {backtest_result['winning_trades']}")
+if backtest_result['total_trades'] > 0:
+    win_rate = (backtest_result['winning_trades']/backtest_result['total_trades']) * 100
+    print(f"  Win Rate: {win_rate:.1f}%\n")
+else:
+    print(f"  Win Rate: N/A\n")
+
+print("─" * 85)
+print("STEP 5: TOP 5 TRADES")
+print("─" * 85 + "\n")
+
+if backtest_result["trades"]:
+    sorted_trades = sorted(backtest_result["trades"], key=lambda x: abs(x["pnl"]), reverse=True)[:5]
+    for idx, trade in enumerate(sorted_trades, 1):
+        print(f"Trade {idx}: {trade['type'].upper()}")
+        print(f"  Entry Day: {dates[trade['entry']].date()} | Spread: {trade['entry_spread']:.4f}")
+        print(f"  Exit Day: {dates[trade['exit']].date()} | Spread: {trade['exit_spread']:.4f}")
+        print(f"  P&L: ₹{trade['pnl']:.2f}\n")
+
+print("─" * 85)
+print("STEP 6: CURRENT MARKET SIGNAL")
+print("─" * 85 + "\n")
+
+current_z = metrics["z_scores"][-1]
+current_spread = trader.spread[-1]
+
+print(f"Real-time Status (as of {dates[-1].date()}):")
+print(f"  Spread: {current_spread:.4f}")
+print(f"  Z-Score: {current_z:.2f}")
+
+if current_z > 2:
+    signal = "🔴 SHORT - Spread overextended, expect mean reversion"
+elif current_z < -2:
+    signal = "🟢 LONG - Spread depressed, expect mean reversion"
+else:
+    signal = "⚪ NEUTRAL - No clear setup"
+
+print(f"  Signal: {signal}\n")
+
+print("─" * 85)
+print("MATHEMATICAL FRAMEWORK USED:")
+print("─" * 85)
+print("""
+1. COINTEGRATION TEST (ADF Test)
+   Tests if spread is stationary: ΔY_t = αY_{t-1} + ε_t
+   
+2. HEDGING RATIO (OLS)
+   Minimizes spread variance: ratio = Cov(S1,S2) / Var(S2)
+   
+3. Z-SCORE SIGNALS
+   Entry: |Z| > 2σ (>95% confidence of mean reversion)
+   Exit: |Z| < 0.5σ (position squared off)
+   
+4. KALMAN FILTER
+   Updates estimate: x_k = x_{k-1} + K_k(z_k - x_{k-1})
+   Where K_k = P_{k-1} / (P_{k-1} + R)
+   
+5. BACKTESTING
+   P&L = Position × ΔSpread × Scaling Factor - Transaction Costs
+""")
+
+print("="*85)
+
+fig = create_visualization(f"{s1_name}/{s2_name}", 
+                          np.column_stack([trader.s1, trader.s2]),
+                          trader.spread, metrics, signals, backtest_result, dates)
+
+fig.savefig('/mnt/user-data/outputs/pairs_trading_analysis.png', dpi=150, bbox_inches='tight')
+print("\n✓ Visualization saved: pairs_trading_analysis.png")
+print("="*85 + "\n")
