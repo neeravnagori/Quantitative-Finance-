@@ -1,0 +1,535 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.linear_model import LinearRegression
+import warnings
+
+warnings.filterwarnings("ignore")
+
+
+# ============================================================
+# 1. HISTORICAL COMPARABLE IPO DATABASE
+# ============================================================
+
+class IPOHistoricalDatabase:
+    @staticmethod
+    def get_comparable_ipos():
+        data = {
+            "Company": [
+                "Google", "Facebook", "Alibaba", "Tesla", "DoorDash",
+                "Airbnb", "Stripe Private Proxy", "Rivian", "Amazon", "Microsoft"
+            ],
+            "IPO_Year": [2004, 2012, 2014, 2010, 2020, 2020, 2020, 2021, 1997, 1986],
+            "IPO_Price": [100, 38, 68, 17, 102, 146, 950, 78, 18, 21],
+            "First_Day_Return": [0.34, 0.61, 36.32, 40.52, 4.76, 0.00, 0.00, 29.13, 68.06, 32.74],
+            "Market_Cap_IPO_Billions": [23, 104, 231, 24.6, 32.2, 100.5, 95, 66, 438, 620],
+            "Sector": ["Tech", "Tech", "Tech", "Auto", "Tech", "Tech", "Fintech", "Auto", "Tech", "Tech"],
+            "Founder_Led": [1, 1, 1, 1, 0, 1, 1, 1, 1, 1],
+            "Profitability": [0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+            "Revenue_Growth": [0.30, 0.55, 0.45, 0.50, 0.40, 0.35, 0.50, 0.25, 1.50, 1.20],
+            "One_Year_Return": [25.3, 52.1, 38.5, 242.8, 112.3, 75.4, 120.0, -38.5, 20.5, 75.2]
+        }
+
+        return pd.DataFrame(data)
+
+
+# ============================================================
+# 2. QUANT IPO REGRESSION MODEL
+# ============================================================
+
+class QuantIPOModel:
+    def __init__(self, historical_data):
+        self.historical_data = historical_data
+        self.model = LinearRegression()
+
+    def engineer_features(self, data):
+        features = pd.DataFrame()
+
+        features["MarketCapLog"] = np.log10(data["Market_Cap_IPO_Billions"] + 1)
+        features["RevenueGrowth"] = data["Revenue_Growth"]
+        features["FounderLed"] = data["Founder_Led"]
+        features["Profitability"] = data["Profitability"]
+        features["TechSector"] = (data["Sector"] == "Tech").astype(int)
+        features["AutoSector"] = (data["Sector"] == "Auto").astype(int)
+
+        return features
+
+    def train_model(self):
+        X = self.engineer_features(self.historical_data)
+        y = self.historical_data["One_Year_Return"].values
+
+        self.model.fit(X, y)
+
+        self.feature_names = X.columns.tolist()
+        self.feature_importance = np.abs(self.model.coef_)
+
+        r_squared = self.model.score(X, y)
+        return r_squared
+
+    def predict_spacex(self, spacex_params):
+        spacex_df = pd.DataFrame([spacex_params])
+        features = self.engineer_features(spacex_df)
+
+        base_prediction = self.model.predict(features)[0]
+        uncertainty_adjustment = self.calculate_novelty_adjustment(spacex_params)
+        confidence_interval = self.bootstrap_uncertainty(features)
+
+        adjusted_prediction = base_prediction + uncertainty_adjustment
+
+        return {
+            "base_prediction": base_prediction,
+            "uncertainty_adjustment": uncertainty_adjustment,
+            "adjusted_prediction": adjusted_prediction,
+            "confidence_interval": confidence_interval,
+            "feature_importance": dict(zip(self.feature_names, self.feature_importance))
+        }
+
+    def calculate_novelty_adjustment(self, spacex_params):
+        novelty_score = 0
+
+        if spacex_params["Market_Cap_IPO_Billions"] > 150:
+            novelty_score += 15
+
+        if spacex_params["Revenue_Growth"] > 0.50:
+            novelty_score += 10
+
+        if spacex_params["Sector"] == "Space/Aerospace":
+            novelty_score += 30
+
+        if spacex_params.get("Government_Contracts", 0) == 1:
+            novelty_score += 20
+
+        historical_volatility = self.historical_data["One_Year_Return"].std()
+        novelty_adjustment = -(novelty_score / 100) * historical_volatility
+
+        return novelty_adjustment
+
+    def bootstrap_uncertainty(self, features, n_bootstraps=1000):
+        np.random.seed(42)
+
+        predictions = []
+
+        for _ in range(n_bootstraps):
+            noise = np.random.normal(0, 30)
+            prediction = self.model.predict(features)[0] + noise
+            predictions.append(prediction)
+
+        predictions = np.array(predictions)
+
+        return {
+            "lower": np.percentile(predictions, 2.5),
+            "upper": np.percentile(predictions, 97.5),
+            "median": np.median(predictions)
+        }
+
+
+# ============================================================
+# 3. MONTE CARLO SCENARIO ENGINE
+# ============================================================
+
+class MonteCarloScenarioEngine:
+    @staticmethod
+    def generate_ipo_trajectories(base_price):
+        days = 252
+
+        scenario_inputs = [
+            {"name": "Bull Case", "annual_return": 150, "volatility": 0.35, "probability": 0.15},
+            {"name": "Base Case", "annual_return": 75, "volatility": 0.45, "probability": 0.45},
+            {"name": "Neutral Case", "annual_return": 20, "volatility": 0.50, "probability": 0.25},
+            {"name": "Bear Case", "annual_return": -30, "volatility": 0.60, "probability": 0.10},
+            {"name": "Catastrophic Case", "annual_return": -60, "volatility": 0.80, "probability": 0.05}
+        ]
+
+        np.random.seed(42)
+        trajectories = {}
+
+        for scenario in scenario_inputs:
+            daily_return = scenario["annual_return"] / 100 / days
+            daily_volatility = scenario["volatility"] / np.sqrt(days)
+
+            returns = np.random.normal(daily_return, daily_volatility, days)
+            price_path = base_price * np.exp(np.cumsum(returns))
+
+            trajectories[scenario["name"]] = {
+                "prices": price_path,
+                "probability": scenario["probability"],
+                "final_price": price_path[-1],
+                "max_price": np.max(price_path),
+                "min_price": np.min(price_path),
+                "annual_return": (price_path[-1] / base_price - 1) * 100
+            }
+
+        return trajectories
+
+
+# ============================================================
+# 4. TECHNICAL INDICATORS
+# ============================================================
+
+def calculate_technical_indicators(prices):
+    indicators = {}
+
+    price_series = pd.Series(prices)
+
+    indicators["SMA_20"] = price_series.rolling(window=20).mean().values
+    indicators["SMA_50"] = price_series.rolling(window=50).mean().values
+
+    rolling_mean = price_series.rolling(window=20).mean()
+    rolling_std = price_series.rolling(window=20).std()
+
+    indicators["BB_Upper"] = (rolling_mean + 2 * rolling_std).values
+    indicators["BB_Lower"] = (rolling_mean - 2 * rolling_std).values
+
+    delta = price_series.diff()
+
+    gain = delta.where(delta > 0, 0).rolling(window=14).mean()
+    loss = -delta.where(delta < 0, 0).rolling(window=14).mean()
+
+    rs = gain / loss
+    indicators["RSI"] = (100 - (100 / (1 + rs))).values
+
+    ema_12 = price_series.ewm(span=12, adjust=False).mean()
+    ema_26 = price_series.ewm(span=26, adjust=False).mean()
+
+    macd = ema_12 - ema_26
+    signal = macd.ewm(span=9, adjust=False).mean()
+
+    indicators["MACD"] = macd.values
+    indicators["MACD_Signal"] = signal.values
+
+    true_range = np.abs(np.diff(prices, prepend=prices[0]))
+    indicators["ATR"] = pd.Series(true_range).rolling(window=14).mean().values
+
+    return indicators
+
+
+# ============================================================
+# 5. DASHBOARD IMAGE GENERATOR
+# ============================================================
+
+def create_quant_dashboard(price_history, indicators, prediction, scenarios, spacex_params, r_squared):
+    dates = pd.date_range(start="2025-07-01", periods=len(price_history), freq="D")
+
+    fig = plt.figure(figsize=(20, 11))
+    fig.patch.set_facecolor("#050b18")
+
+    gs = fig.add_gridspec(
+        4, 4,
+        height_ratios=[0.7, 2.7, 1.6, 0.8],
+        width_ratios=[2.2, 2.2, 1.35, 1.35],
+        hspace=0.35,
+        wspace=0.25
+    )
+
+    # ---------------- Header ----------------
+    ax_header = fig.add_subplot(gs[0, :])
+    ax_header.axis("off")
+    ax_header.set_facecolor("#050b18")
+
+    ax_header.text(
+        0.01, 0.72,
+        "SPACEX IPO QUANT MODEL DASHBOARD",
+        fontsize=26,
+        fontweight="bold",
+        color="white",
+        transform=ax_header.transAxes
+    )
+
+    ax_header.text(
+        0.01, 0.34,
+        "Comparable-IPO Regression + Monte Carlo Scenario Analysis",
+        fontsize=15,
+        color="#00e5ff",
+        transform=ax_header.transAxes
+    )
+
+    ax_header.text(
+        0.01, 0.05,
+        "Hypothetical research model based on historical comparable IPOs | Not investment advice",
+        fontsize=10,
+        color="#9ca3af",
+        transform=ax_header.transAxes
+    )
+
+    # ---------------- Main price chart ----------------
+    ax_price = fig.add_subplot(gs[1:3, 0:2])
+    ax_price.set_facecolor("#081426")
+
+    ax_price.plot(dates, price_history, color="#22c55e", linewidth=2.6, label="SPACEX Price")
+    ax_price.plot(dates, indicators["SMA_20"], color="#facc15", linewidth=1.6, linestyle="--", label="SMA 20")
+    ax_price.plot(dates, indicators["SMA_50"], color="#fb923c", linewidth=1.6, linestyle="--", label="SMA 50")
+
+    ax_price.fill_between(
+        dates,
+        indicators["BB_Upper"],
+        indicators["BB_Lower"],
+        color="#3b82f6",
+        alpha=0.16,
+        label="Bollinger Bands"
+    )
+
+    ax_price.set_title(
+        "Projected Price Path & Technical Structure",
+        fontsize=15,
+        fontweight="bold",
+        color="white",
+        pad=14
+    )
+
+    ax_price.set_ylabel("Price", color="white")
+    ax_price.grid(True, linestyle=":", alpha=0.25, color="#38bdf8")
+    ax_price.tick_params(colors="white")
+    ax_price.legend(facecolor="#0f172a", edgecolor="#38bdf8", labelcolor="white", fontsize=9)
+
+    for spine in ax_price.spines.values():
+        spine.set_color("#2563eb")
+
+    # ---------------- KPI cards ----------------
+    kpi_grid = gs[1, 2:].subgridspec(4, 2, hspace=0.25, wspace=0.18)
+
+    kpis = [
+        ("Comparable IPOs", "10", "#38bdf8"),
+        ("Model R²", f"{r_squared * 100:.2f}%", "#93c5fd"),
+        ("Base 1Y Return", f"{prediction['base_prediction']:.2f}%", "#22c55e"),
+        ("Novelty Adjustment", f"{prediction['uncertainty_adjustment']:.2f}%", "#fb7185"),
+        ("Adjusted 1Y Return", f"{prediction['adjusted_prediction']:.2f}%", "#22d3ee"),
+        ("Bootstrap Range", f"{prediction['confidence_interval']['lower']:.2f}% to {prediction['confidence_interval']['upper']:.2f}%", "#facc15"),
+        ("IPO Price", f"₹{spacex_params['IPO_Price']}", "#38bdf8"),
+        ("Market Cap", f"${spacex_params['Market_Cap_IPO_Billions']}B", "#a78bfa")
+    ]
+
+    for i, (label, value, color) in enumerate(kpis):
+        ax = fig.add_subplot(kpi_grid[i // 2, i % 2])
+        ax.set_facecolor("#07172a")
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+        for spine in ax.spines.values():
+            spine.set_color("#164e63")
+
+        ax.text(0.06, 0.64, label, color="white", fontsize=9, transform=ax.transAxes)
+        ax.text(0.06, 0.22, value, color=color, fontsize=16, fontweight="bold", transform=ax.transAxes)
+
+    # ---------------- RSI ----------------
+    ax_rsi = fig.add_subplot(gs[3, 0])
+    ax_rsi.set_facecolor("#081426")
+    ax_rsi.plot(dates[-80:], indicators["RSI"][-80:], color="#d946ef", linewidth=1.8)
+    ax_rsi.axhline(70, color="#ef4444", linestyle="--")
+    ax_rsi.axhline(30, color="#22c55e", linestyle="--")
+    ax_rsi.set_title("RSI (14)", color="white", fontsize=10)
+    ax_rsi.set_ylim(0, 100)
+    ax_rsi.grid(True, linestyle=":", alpha=0.2)
+    ax_rsi.tick_params(colors="white", labelsize=8)
+
+    # ---------------- Volume ----------------
+    ax_volume = fig.add_subplot(gs[3, 1])
+    ax_volume.set_facecolor("#081426")
+    np.random.seed(42)
+    volumes = np.random.randint(1_000_000, 5_000_000, len(price_history))
+    ax_volume.bar(dates[-80:], volumes[-80:], color="#22c55e", alpha=0.75)
+    ax_volume.set_title("Volume", color="white", fontsize=10)
+    ax_volume.grid(True, axis="y", linestyle=":", alpha=0.2)
+    ax_volume.tick_params(colors="white", labelsize=8)
+
+    # ---------------- Scenario table ----------------
+    ax_scenarios = fig.add_subplot(gs[2:, 2])
+    ax_scenarios.set_facecolor("#07172a")
+    ax_scenarios.set_xticks([])
+    ax_scenarios.set_yticks([])
+
+    for spine in ax_scenarios.spines.values():
+        spine.set_color("#164e63")
+
+    ax_scenarios.text(
+        0.05, 0.92,
+        "SCENARIO ANALYSIS",
+        color="white",
+        fontsize=12,
+        fontweight="bold",
+        transform=ax_scenarios.transAxes
+    )
+
+    y = 0.78
+    for name, scenario in scenarios.items():
+        ax_scenarios.text(0.06, y, name, color="white", fontsize=9, transform=ax_scenarios.transAxes)
+        ax_scenarios.text(
+            0.62, y,
+            f"{scenario['probability'] * 100:.0f}%",
+            color="#38bdf8",
+            fontsize=9,
+            transform=ax_scenarios.transAxes
+        )
+        ax_scenarios.text(
+            0.80, y,
+            f"{scenario['annual_return']:.1f}%",
+            color="#22c55e" if scenario["annual_return"] > 0 else "#ef4444",
+            fontsize=9,
+            transform=ax_scenarios.transAxes
+        )
+        y -= 0.13
+
+    # ---------------- Feature importance ----------------
+    ax_features = fig.add_subplot(gs[2:, 3])
+    ax_features.set_facecolor("#07172a")
+
+    importance = prediction["feature_importance"]
+    feature_names = list(importance.keys())
+    feature_values = np.array(list(importance.values()))
+
+    feature_values_pct = feature_values / feature_values.sum() * 100
+    order = np.argsort(feature_values_pct)
+
+    ax_features.barh(
+        np.array(feature_names)[order],
+        feature_values_pct[order],
+        color="#38bdf8"
+    )
+
+    ax_features.set_title("MODEL DRIVERS", color="white", fontsize=12, fontweight="bold")
+    ax_features.tick_params(colors="white", labelsize=8)
+    ax_features.grid(True, axis="x", linestyle=":", alpha=0.2)
+
+    for spine in ax_features.spines.values():
+        spine.set_color("#164e63")
+
+    # ---------------- Footer ----------------
+    fig.text(
+        0.015, 0.015,
+        "Note: This is a hypothetical educational model. SpaceX is private and no confirmed IPO terms are assumed.",
+        color="#9ca3af",
+        fontsize=9
+    )
+
+    output_path = "spacex_ipo_quant_dashboard.png"
+    plt.savefig(output_path, dpi=180, bbox_inches="tight", facecolor="#050b18")
+    plt.show()
+
+    return output_path
+
+
+# ============================================================
+# 6. RUN FULL MODEL
+# ============================================================
+
+print("\n" + "=" * 90)
+print("SPACEX IPO: ADVANCED QUANTITATIVE ANALYSIS")
+print("=" * 90)
+
+historical_ipos = IPOHistoricalDatabase.get_comparable_ipos()
+
+print("\nSTEP 1: Historical IPO Database")
+print("-" * 90)
+print(f"Comparable IPOs analyzed: {len(historical_ipos)}")
+print(f"Average first-day return: {historical_ipos['First_Day_Return'].mean():.2f}%")
+print(f"Average one-year return: {historical_ipos['One_Year_Return'].mean():.2f}%")
+
+print("\nSTEP 2: Training Comparable IPO Regression Model")
+print("-" * 90)
+
+model = QuantIPOModel(historical_ipos)
+r_squared = model.train_model()
+
+print(f"Model R² Score: {r_squared:.4f}")
+print(f"Model explains approximately {r_squared * 100:.2f}% of variation in one-year IPO returns.")
+
+print("\nFeature Importance Ranking:")
+for feature, importance in sorted(
+    zip(model.feature_names, model.feature_importance),
+    key=lambda x: x[1],
+    reverse=True
+):
+    print(f"  {feature}: {importance:.4f}")
+
+print("\nSTEP 3: SpaceX IPO Assumptions")
+print("-" * 90)
+
+spacex_params = {
+    "Company": "SpaceX",
+    "IPO_Year": 2026,
+    "IPO_Price": 85,
+    "Market_Cap_IPO_Billions": 180,
+    "Sector": "Space/Aerospace",
+    "Founder_Led": 1,
+    "Profitability": 0,
+    "Revenue_Growth": 0.75,
+    "Government_Contracts": 1
+}
+
+for key, value in spacex_params.items():
+    print(f"{key}: {value}")
+
+print("\nSTEP 4: Prediction")
+print("-" * 90)
+
+prediction = model.predict_spacex(spacex_params)
+
+print(f"Base model prediction: {prediction['base_prediction']:.2f}%")
+print(f"Novelty adjustment: {prediction['uncertainty_adjustment']:.2f}%")
+print(f"Adjusted one-year return prediction: {prediction['adjusted_prediction']:.2f}%")
+print(
+    f"95% bootstrap range: "
+    f"{prediction['confidence_interval']['lower']:.2f}% "
+    f"to {prediction['confidence_interval']['upper']:.2f}%"
+)
+
+print("\nSTEP 5: Monte Carlo Scenario Analysis")
+print("-" * 90)
+
+scenarios = MonteCarloScenarioEngine.generate_ipo_trajectories(
+    base_price=spacex_params["IPO_Price"]
+)
+
+for name, scenario in scenarios.items():
+    print(f"\n{name}")
+    print(f"Probability: {scenario['probability'] * 100:.1f}%")
+    print(f"Final Price: ₹{scenario['final_price']:.2f}")
+    print(f"One-Year Return: {scenario['annual_return']:.2f}%")
+    print(f"Max Price: ₹{scenario['max_price']:.2f}")
+    print(f"Min Price: ₹{scenario['min_price']:.2f}")
+
+expected_price = sum(
+    scenario["final_price"] * scenario["probability"]
+    for scenario in scenarios.values()
+)
+
+expected_return = (expected_price / spacex_params["IPO_Price"] - 1) * 100
+
+print("\nSTEP 6: Probability-Weighted Output")
+print("-" * 90)
+print(f"Expected one-year price target: ₹{expected_price:.2f}")
+print(f"Probability-weighted expected return: {expected_return:.2f}%")
+
+print("\nSTEP 7: Generating Technical Price Path")
+print("-" * 90)
+
+np.random.seed(42)
+
+daily_returns = np.random.normal(
+    expected_return / 100 / 252,
+    0.04 / np.sqrt(252),
+    252
+)
+
+price_history = spacex_params["IPO_Price"] * np.exp(np.cumsum(daily_returns))
+indicators = calculate_technical_indicators(price_history)
+
+print(f"Starting projected price: ₹{price_history[0]:.2f}")
+print(f"Ending projected price: ₹{price_history[-1]:.2f}")
+
+print("\nSTEP 8: Creating Dashboard Image")
+print("-" * 90)
+
+output_file = create_quant_dashboard(
+    price_history=price_history,
+    indicators=indicators,
+    prediction=prediction,
+    scenarios=scenarios,
+    spacex_params=spacex_params,
+    r_squared=r_squared
+)
+
+print(f"\nDashboard saved as: {output_file}")
+
+print("\n" + "=" * 90)
+print("Analysis Complete")
+print("=" * 90)
