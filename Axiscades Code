@@ -1,0 +1,206 @@
+from artifact_tool import Blob, SpreadsheetFile
+import json, math, datetime
+import numpy as np
+import matplotlib.pyplot as plt
+
+# File path
+path = "/mnt/data/AXISCADES Tech.xlsx"
+
+# Load Excel file
+wb = SpreadsheetFile.import_xlsx(Blob.load(path))
+
+# Read relevant table range
+vals = json.loads(
+    wb.inspect({
+        "kind": "table",
+        "range": "Data Sheet!A1:K93",
+        "include": "values",
+        "table_max_rows": 100,
+        "table_max_cols": 12
+    }).ndjson.splitlines()[0]
+)["values"]
+
+# Convert Excel date number to Python date
+def excel_date(n):
+    return datetime.datetime(1899, 12, 30) + datetime.timedelta(days=int(n))
+
+# Annual data
+ann_dates = [excel_date(x).date() for x in vals[15][1:11]]
+sales = np.array(vals[16][1:11], dtype=float)
+net = np.array(vals[29][1:11], dtype=float)
+price = np.array(vals[89][1:11], dtype=float)
+shares = np.array(vals[92][1:11], dtype=float)
+
+eps = net / shares
+curr_price = float(vals[7][1])
+
+# Quarterly data
+q_dates = [excel_date(x).date() for x in vals[40][1:11]]
+sales_q = np.array(vals[41][1:11], dtype=float)
+net_q = np.array(vals[48][1:11], dtype=float)
+op_q = np.array(vals[49][1:11], dtype=float)
+opm_q = op_q / sales_q * 100
+
+# ------------------------------------
+# Quant Model: OLS Regression
+# log(Price) = a + b*log(Sales) + c*Net Margin
+# ------------------------------------
+
+X = np.column_stack([
+    np.ones(len(price)),
+    np.log(sales),
+    net / sales
+])
+
+y = np.log(price)
+
+beta = np.linalg.lstsq(X, y, rcond=None)[0]
+yhat = X @ beta
+
+r2 = 1 - np.sum((y - yhat) ** 2) / np.sum((y - y.mean()) ** 2)
+
+fitted = np.exp(yhat)
+
+pred_latest = math.exp(
+    np.array([1, np.log(sales[-1]), net[-1] / sales[-1]]) @ beta
+)
+
+# ------------------------------------
+# Charting
+# ------------------------------------
+
+fig = plt.figure(figsize=(14, 10), dpi=180)
+
+fig.suptitle(
+    "AXISCADES Technologies: Price Rise + Fundamental Quant Read",
+    fontsize=18,
+    fontweight="bold"
+)
+
+# Chart 1: Stock price re-rating
+ax1 = fig.add_subplot(2, 2, 1)
+ax1.plot(
+    ann_dates,
+    price,
+    marker="o",
+    linewidth=2.2,
+    label="FY closing price"
+)
+ax1.scatter(
+    [ann_dates[-1]],
+    [curr_price],
+    s=70,
+    marker="D",
+    label="Current price in file"
+)
+ax1.set_yscale("log")
+ax1.set_title("Stock Price Re-rating, Log Scale")
+ax1.set_ylabel("Price ₹, log scale")
+ax1.grid(True, alpha=0.3)
+ax1.legend(fontsize=8)
+
+# Chart 2: Sales and net profit
+ax2 = fig.add_subplot(2, 2, 2)
+ax2.plot(
+    ann_dates,
+    sales,
+    marker="o",
+    linewidth=2.2,
+    label="Sales ₹ cr"
+)
+
+ax2b = ax2.twinx()
+ax2b.bar(
+    ann_dates,
+    net,
+    width=120,
+    alpha=0.35,
+    label="Net Profit ₹ cr"
+)
+
+ax2.set_title("Fundamental Recovery: Sales + Net Profit")
+ax2.set_ylabel("Sales ₹ cr")
+ax2b.set_ylabel("Net Profit ₹ cr")
+ax2.grid(True, alpha=0.3)
+
+lines, labels = ax2.get_legend_handles_labels()
+lines2, labels2 = ax2b.get_legend_handles_labels()
+ax2.legend(lines + lines2, labels + labels2, fontsize=8)
+
+# Chart 3: Quarterly trend
+ax3 = fig.add_subplot(2, 2, 3)
+ax3.plot(
+    q_dates,
+    sales_q,
+    marker="o",
+    linewidth=2.2,
+    label="Quarterly Sales ₹ cr"
+)
+
+ax3b = ax3.twinx()
+ax3b.plot(
+    q_dates,
+    opm_q,
+    marker="s",
+    linestyle="--",
+    linewidth=1.8,
+    label="OPM %"
+)
+
+ax3.set_title("Quarterly Trend: Revenue vs Operating Margin")
+ax3.set_ylabel("Quarterly Sales ₹ cr")
+ax3b.set_ylabel("OPM %")
+ax3.grid(True, alpha=0.3)
+
+lines, labels = ax3.get_legend_handles_labels()
+lines2, labels2 = ax3b.get_legend_handles_labels()
+ax3.legend(lines + lines2, labels + labels2, fontsize=8)
+
+# Chart 4: OLS actual vs fitted
+ax4 = fig.add_subplot(2, 2, 4)
+ax4.plot(
+    ann_dates,
+    price,
+    marker="o",
+    linewidth=2.2,
+    label="Actual price"
+)
+
+ax4.plot(
+    ann_dates,
+    fitted,
+    marker="x",
+    linewidth=2,
+    label=f"OLS fitted price, R²={r2:.2f}"
+)
+
+ax4.axhline(
+    pred_latest,
+    linestyle="--",
+    linewidth=1.5,
+    label=f"Model-implied FY26: ₹{pred_latest:,.0f}"
+)
+
+ax4.set_yscale("log")
+ax4.set_title("Quant Model: log(Price) ~ log(Sales) + Net Margin")
+ax4.set_ylabel("Price ₹, log scale")
+ax4.grid(True, alpha=0.3)
+ax4.legend(fontsize=8)
+
+# Footer
+fig.text(
+    0.02,
+    0.015,
+    "Source: uploaded AXISCADES Tech.xlsx. Model is illustrative; annual sample has only 10 observations, so interpret directionally, not as trading advice.",
+    fontsize=8
+)
+
+fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+# Save chart
+plt.savefig("/mnt/data/axis_quant_chart.png", bbox_inches="tight")
+
+print("Chart saved as axis_quant_chart.png")
+print(f"OLS R²: {r2:.2f}")
+print(f"Model-implied FY26 price: ₹{pred_latest:,.0f}")
+print(f"Current price in file: ₹{curr_price:,.2f}")
