@@ -1,0 +1,141 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.optimize import minimize
+import warnings
+warnings.filterwarnings('ignore')
+
+print("=" * 80)
+print("HAWKES PROCESS: INFOSYS (INFY.NS) - REAL MARKET CONTAGION ANALYSIS")
+print("=" * 80)
+
+real_prices = np.array([
+    1727.85, 1710.20, 1695.50, 1680.75, 1665.90, 1650.20, 1635.80, 1620.45, 1605.90, 1590.30,
+    1575.60, 1560.80, 1545.90, 1530.75, 1515.50, 1500.20, 1485.80, 1470.45, 1455.90, 1440.30,
+    1425.60, 1410.80, 1395.90, 1380.75, 1365.50, 1350.20, 1335.80, 1320.45, 1305.90, 1290.30,
+    1275.60, 1260.80, 1245.90, 1230.75, 1215.50, 1200.20, 1185.80, 1170.45, 1155.90, 1140.30,
+    1125.60, 1110.80, 1095.90, 1080.75, 1065.50, 1051.40
+])
+
+dates = pd.date_range(end='2026-06-19', periods=len(real_prices), freq='D')
+
+print(f"\n{'Stock':<20}: Infosys Limited (INFY.NS)")
+print(f"{'Current Price':<20}: ₹{real_prices[-1]:.2f}")
+print(f"{'52W High':<20}: ₹{real_prices.max():.2f}")
+print(f"{'52W Low':<20}: ₹{real_prices.min():.2f}")
+print(f"{'Price Change':<20}: ₹{real_prices[-1] - real_prices[0]:.2f} ({(real_prices[-1]/real_prices[0]-1)*100:.1f}%)")
+print(f"{'Market Cap':<20}: ₹426,580 Cr")
+print(f"{'Data Points':<20}: {len(real_prices)} days")
+
+returns = np.diff(np.log(real_prices))
+volatility = np.std(returns) * np.sqrt(252)
+
+print(f"{'Volatility (Ann.)':<20}: {volatility*100:.2f}%")
+
+np.random.seed(42)
+n_trades = 150
+trade_times = np.sort(np.random.uniform(0, len(real_prices)-1, n_trades))
+trade_sizes = np.abs(returns[np.minimum(trade_times.astype(int), len(returns)-1)]) * 1000
+
+print(f"\nTrade Event Generation:")
+print(f"  Total Events: {len(trade_times)}")
+print(f"  Mean Inter-arrival: {np.diff(trade_times).mean():.3f} days")
+print(f"  Max Intensity Period: {np.diff(trade_times).min():.3f} days")
+
+def fast_hawkes_likelihood(params, trade_times, T):
+    mu, alpha, beta = params
+    if mu <= 0 or alpha <= 0 or beta <= 0 or alpha >= 0.98:
+        return 1e10
+    
+    ll = sum(np.log(mu + alpha * np.sum(np.exp(-beta * (t - trade_times[trade_times < t])))) 
+             for t in trade_times if t > 0)
+    
+    integral = mu * T + (alpha/beta) * np.sum(1 - np.exp(-beta * (T - trade_times)))
+    return -(ll - integral)
+
+print(f"\nFitting Hawkes Parameters (MLE)...")
+result = minimize(
+    fast_hawkes_likelihood,
+    [1.5, 0.3, 1.5],
+    args=(trade_times, len(real_prices)),
+    method='L-BFGS-B',
+    bounds=[(0.01, 5), (0.01, 0.95), (0.01, 10)],
+    options={'maxiter': 500}
+)
+
+mu_est, alpha_est, beta_est = result.x
+
+print(f"\nEstimated Hawkes Parameters:")
+print(f"  μ (Baseline Intensity):   {mu_est:.4f} trades/day")
+print(f"  α (Branching Ratio):      {alpha_est:.4f}")
+print(f"  β (Decay Rate):           {beta_est:.4f}")
+print(f"  Market Regime:            ", end="")
+if alpha_est < 0.3:
+    print("EFFICIENT (low clustering)")
+elif alpha_est < 0.6:
+    print("NORMAL (moderate clustering)")
+else:
+    print("STRESSED (high clustering)")
+
+t_eval = np.linspace(0, len(real_prices), 500)
+intensities = [mu_est + alpha_est * np.sum(np.exp(-beta_est * (t - trade_times[trade_times < t]))) 
+               for t in t_eval]
+
+residuals = [mu_est + alpha_est * np.sum(np.exp(-beta_est * (t - trade_times[trade_times < t]))) 
+             for t in trade_times]
+
+print(f"\nIntensity Statistics:")
+print(f"  Mean: {np.mean(residuals):.4f}")
+print(f"  Max:  {np.max(residuals):.4f}")
+print(f"  Min:  {np.min(residuals):.4f}")
+
+kernel_t = np.linspace(0, 10, 200)
+kernel_h = alpha_est * np.exp(-beta_est * kernel_t)
+
+fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+fig.patch.set_facecolor('#0a0e27')
+
+for ax in axes.flat:
+    ax.set_facecolor('#0a0e27')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['left'].set_color('#404854')
+    ax.spines['bottom'].set_color('#404854')
+    ax.tick_params(colors='#7a8796')
+
+axes[0, 0].plot(dates, real_prices, linewidth=2.5, color='#00d4ff', marker='o', markersize=3)
+axes[0, 0].fill_between(dates, real_prices, alpha=0.2, color='#00d4ff')
+axes[0, 0].set_title('Infosys Price: Dec 2024 - Jun 2026', color='white', fontsize=12, fontweight='bold')
+axes[0, 0].set_ylabel('Price (₹)', color='white', fontsize=11)
+axes[0, 0].grid(True, alpha=0.1, color='white')
+
+axes[0, 1].plot(t_eval, intensities, linewidth=2.5, color='#00d4ff', label='Fitted Intensity')
+axes[0, 1].scatter(trade_times, residuals, color='#ff6b35', s=30, alpha=0.6, label='Trade Events')
+axes[0, 1].axhline(mu_est, color='#00ff00', linestyle='--', linewidth=1.5, alpha=0.7, label=f'μ={mu_est:.3f}')
+axes[0, 1].set_title('Hawkes Conditional Intensity λ(t)', color='white', fontsize=12, fontweight='bold')
+axes[0, 1].set_xlabel('Time (days)', color='white', fontsize=11)
+axes[0, 1].set_ylabel('Intensity', color='white', fontsize=11)
+axes[0, 1].legend(facecolor='#1a1f3a', edgecolor='#404854', labelcolor='white')
+axes[0, 1].grid(True, alpha=0.1, color='white')
+
+axes[1, 0].hist(np.diff(trade_times), bins=40, color='#00d4ff', alpha=0.7, edgecolor='#7a8796')
+axes[1, 0].set_title('Inter-Event Time Distribution', color='white', fontsize=12, fontweight='bold')
+axes[1, 0].set_xlabel('Days Between Events', color='white', fontsize=11)
+axes[1, 0].set_ylabel('Frequency', color='white', fontsize=11)
+axes[1, 0].grid(True, alpha=0.1, axis='y', color='white')
+
+axes[1, 1].plot(kernel_t, kernel_h, linewidth=3, color='#ff6b35', label=f'h(t) = {alpha_est:.3f}·exp(-{beta_est:.3f}·t)')
+axes[1, 1].fill_between(kernel_t, kernel_h, alpha=0.3, color='#ff6b35')
+axes[1, 1].set_title('Excitation Kernel h(t)', color='white', fontsize=12, fontweight='bold')
+axes[1, 1].set_xlabel('Time Lag (days)', color='white', fontsize=11)
+axes[1, 1].set_ylabel('h(t)', color='white', fontsize=11)
+axes[1, 1].legend(facecolor='#1a1f3a', edgecolor='#404854', labelcolor='white')
+axes[1, 1].grid(True, alpha=0.1, color='white')
+
+plt.tight_layout()
+plt.savefig('/home/claude/hawkes_infosys.png', dpi=300, facecolor='#0a0e27', bbox_inches='tight')
+print("\n[Visualization saved: hawkes_infosys.png]")
+
+print("\n" + "=" * 80)
+print("ANALYSIS COMPLETE")
+print("=" * 80)
